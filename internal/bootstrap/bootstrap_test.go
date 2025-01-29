@@ -2,7 +2,6 @@ package bootstrap_test
 
 import (
 	"context"
-	"errors"
 	"net"
 	"net/netip"
 	"net/url"
@@ -10,6 +9,8 @@ import (
 	"time"
 
 	"github.com/AdguardTeam/dnsproxy/internal/bootstrap"
+	"github.com/AdguardTeam/golibs/errors"
+	"github.com/AdguardTeam/golibs/logutil/slogutil"
 	"github.com/AdguardTeam/golibs/netutil"
 	"github.com/AdguardTeam/golibs/testutil"
 	"github.com/stretchr/testify/assert"
@@ -54,6 +55,8 @@ func TestResolveDialContext(t *testing.T) {
 	ipp := newListener(t, "tcp", sig)
 	port := ipp.Port()
 
+	l := slogutil.NewDiscardLogger()
+
 	testCases := []struct {
 		name       string
 		addresses  []netip.Addr
@@ -87,7 +90,7 @@ func TestResolveDialContext(t *testing.T) {
 				network string,
 				host string,
 			) (addrs []netip.Addr, err error) {
-				require.Equal(pt, "ip", network)
+				require.Equal(pt, bootstrap.NetworkIP, network)
 				require.Equal(pt, hostname, host)
 
 				return tc.addresses, nil
@@ -96,14 +99,15 @@ func TestResolveDialContext(t *testing.T) {
 
 		t.Run(tc.name, func(t *testing.T) {
 			dialContext, err := bootstrap.ResolveDialContext(
-				&url.URL{Host: netutil.JoinHostPort(hostname, int(port))},
+				&url.URL{Host: netutil.JoinHostPort(hostname, port)},
 				testTimeout,
-				[]bootstrap.Resolver{r},
+				bootstrap.ParallelResolver{r},
 				tc.preferIPv6,
+				l,
 			)
 			require.NoError(t, err)
 
-			conn, err := dialContext(context.Background(), "tcp", "")
+			conn, err := dialContext(context.Background(), bootstrap.NetworkTCP, "")
 			require.NoError(t, err)
 
 			expected, ok := testutil.RequireReceive(t, sig, testTimeout)
@@ -120,7 +124,7 @@ func TestResolveDialContext(t *testing.T) {
 				network string,
 				host string,
 			) (addrs []netip.Addr, err error) {
-				require.Equal(pt, "ip", network)
+				require.Equal(pt, bootstrap.NetworkIP, network)
 				require.Equal(pt, hostname, host)
 
 				return nil, nil
@@ -128,14 +132,15 @@ func TestResolveDialContext(t *testing.T) {
 		}
 
 		dialContext, err := bootstrap.ResolveDialContext(
-			&url.URL{Host: netutil.JoinHostPort(hostname, int(port))},
+			&url.URL{Host: netutil.JoinHostPort(hostname, port)},
 			testTimeout,
-			[]bootstrap.Resolver{r},
+			bootstrap.ParallelResolver{r},
 			false,
+			l,
 		)
 		require.NoError(t, err)
 
-		_, err = dialContext(context.Background(), "tcp", "")
+		_, err = dialContext(context.Background(), bootstrap.NetworkTCP, "")
 		testutil.AssertErrorMsg(t, "no addresses", err)
 	})
 
@@ -148,6 +153,7 @@ func TestResolveDialContext(t *testing.T) {
 			testTimeout,
 			nil,
 			false,
+			l,
 		)
 		testutil.AssertErrorMsg(t, errMsg, err)
 
@@ -156,10 +162,11 @@ func TestResolveDialContext(t *testing.T) {
 
 	t.Run("no_resolvers", func(t *testing.T) {
 		dialContext, err := bootstrap.ResolveDialContext(
-			&url.URL{Host: netutil.JoinHostPort(hostname, int(port))},
+			&url.URL{Host: netutil.JoinHostPort(hostname, port)},
 			testTimeout,
 			nil,
 			false,
+			l,
 		)
 		assert.ErrorIs(t, err, bootstrap.ErrNoResolvers)
 		assert.Nil(t, dialContext)

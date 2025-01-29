@@ -8,16 +8,18 @@ import (
 	"crypto/x509"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/netip"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/AdguardTeam/dnsproxy/internal/bootstrap"
-	"github.com/AdguardTeam/golibs/log"
+	"github.com/AdguardTeam/golibs/errors"
+	"github.com/AdguardTeam/golibs/logutil/slogutil"
 	"github.com/AdguardTeam/golibs/netutil"
 	"github.com/ameshkov/dnscrypt/v2"
 	"github.com/ameshkov/dnsstamps"
@@ -26,17 +28,20 @@ import (
 	"github.com/quic-go/quic-go/logging"
 )
 
-// Upstream is an interface for a DNS resolver.
+// Upstream is an interface for a DNS resolver.  All the methods must be safe
+// for concurrent use.
 type Upstream interface {
-	// Exchange sends the DNS query req to this upstream and returns the
-	// response that has been received or an error if something went wrong.
-	Exchange(req *dns.Msg) (*dns.Msg, error)
+	// Exchange sends req to this upstream and returns the response that has
+	// been received or an error if something went wrong.  The implementations
+	// must not modify req as well as the caller must not modify it until the
+	// method returns.  It shouldn't be called after closing.
+	Exchange(req *dns.Msg) (resp *dns.Msg, err error)
 
-	// Address returns the address of the upstream DNS resolver.
-	Address() string
+	// Address returns the human-readable address of the upstream DNS resolver.
+	// It may differ from what was passed to [AddressToUpstream].
+	Address() (addr string)
 
-	// Closer used to close the upstreams properly.  Exchange shouldn't be
-	// called after calling Close.
+	// Closer used to close the upstreams properly.
 	io.Closer
 }
 
@@ -46,11 +51,15 @@ type QUICTraceFunc func(
 	ctx context.Context,
 	role logging.Perspective,
 	connID quic.ConnectionID,
-) (tracer logging.ConnectionTracer)
+) (tracer *logging.ConnectionTracer)
 
 // Options for AddressToUpstream func.  With these options we can configure the
 // upstream properties.
 type Options struct {
+	// Logger is used for logging during parsing and upstream exchange.  If nil,
+	// [slog.Default] is used.
+	Logger *slog.Logger
+
 	// VerifyServerCertificate is used to set the VerifyPeerCertificate property
 	// of the *tls.Config for DNS-over-HTTPS, DNS-over-QUIC, and DNS-over-TLS.
 	VerifyServerCertificate func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error
@@ -76,15 +85,9 @@ type Options struct {
 	// CipherSuites is a custom list of TLSv1.2 ciphers.
 	CipherSuites []uint16
 
-	// Bootstrap is a list of DNS servers to be used to resolve
-	// DNS-over-HTTPS/DNS-over-TLS hostnames.  Plain DNS, DNSCrypt, or
-	// DNS-over-HTTPS/DNS-over-TLS with IP addresses (not hostnames) could be
-	// used.
-	Bootstrap []string
-
-	// List of IP addresses of the upstream DNS server.  If not empty, bootstrap
-	// DNS servers won't be used at all.
-	ServerIPAddrs []net.IP
+	// Bootstrap is used to resolve upstreams' hostnames.  If nil, the
+	// [net.DefaultResolver] will be used.
+	Bootstrap Resolver
 
 	// HTTPVersions is a list of HTTP versions that should be supported by the
 	// DNS-over-HTTPS client.  If not set, HTTP/1.1 and HTTP/2 will be used.
@@ -107,7 +110,6 @@ func (o *Options) Clone() (clone *Options) {
 	return &Options{
 		Bootstrap:                 o.Bootstrap,
 		Timeout:                   o.Timeout,
-		ServerIPAddrs:             o.ServerIPAddrs,
 		HTTPVersions:              o.HTTPVersions,
 		VerifyServerCertificate:   o.VerifyServerCertificate,
 		VerifyConnection:          o.VerifyConnection,
@@ -117,6 +119,7 @@ func (o *Options) Clone() (clone *Options) {
 		QUICTracer:                o.QUICTracer,
 		RootCAs:                   o.RootCAs,
 		CipherSuites:              o.CipherSuites,
+		Logger:                    o.Logger,
 	}
 }
 
@@ -157,6 +160,7 @@ const (
 // AddressToUpstream converts addr to an Upstream using the specified options.
 // addr can be either a URL, or a plain address, either a domain name or an IP.
 //
+//   - 1.2.3.4 or 1.2.3.4:4321 for plain DNS using IP address;
 //   - udp://5.3.5.3:53 or 5.3.5.3:53 for plain DNS using IP address;
 //   - udp://name.server:53 or name.server:53 for plain DNS using domain name;
 //   - tcp://5.3.5.3:53 for plain DNS-over-TCP using IP address;
@@ -182,31 +186,72 @@ func AddressToUpstream(addr string, opts *Options) (u Upstream, err error) {
 		opts = &Options{}
 	}
 
+	if opts.Logger == nil {
+		opts.Logger = slog.Default()
+	}
+
 	var uu *url.URL
 	if strings.Contains(addr, "://") {
-		// Parse as URL.
 		uu, err = url.Parse(addr)
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse %s: %w", addr, err)
 		}
 	} else {
-		// Probably, plain UDP upstream defined by address or address:port.
-		_, port, splitErr := net.SplitHostPort(addr)
-		if splitErr == nil {
-			// Validate port.
-			_, err = strconv.ParseUint(port, 10, 16)
-			if err != nil {
-				return nil, fmt.Errorf("invalid address %s: %w", addr, err)
-			}
-		}
-
 		uu = &url.URL{
 			Scheme: "udp",
 			Host:   addr,
 		}
 	}
 
+	err = validateUpstreamURL(uu)
+	if err != nil {
+		// Don't wrap the error, because it's informative enough as is.
+		return nil, err
+	}
+
 	return urlToUpstream(uu, opts)
+}
+
+// validateUpstreamURL returns an error if the upstream URL is not valid.
+func validateUpstreamURL(u *url.URL) (err error) {
+	if u.Scheme == "sdns" {
+		return nil
+	}
+
+	host := u.Host
+	// TODO(s.chzhen):  Consider using [netutil.SplitHostPort].
+	h, port, splitErr := net.SplitHostPort(host)
+	if splitErr == nil {
+		// Validate port.
+		_, err = strconv.ParseUint(port, 10, 16)
+		if err != nil {
+			return fmt.Errorf("invalid port %s: %w", port, err)
+		}
+
+		host = h
+	}
+
+	// minEnclosedIPv6Len is the minimum length of an IP address enclosed in
+	// square brackets.
+	const minEnclosedIPv6Len = len("[::]")
+
+	possibleIP := host
+	if l := len(host); l >= minEnclosedIPv6Len && host[0] == '[' && host[l-1] == ']' {
+		// Might be an IPv6 address enclosed in square brackets with no port.
+		//
+		// See https://github.com/AdguardTeam/dnsproxy/issues/379.
+		possibleIP = host[1 : l-1]
+	}
+	if netutil.IsValidIPString(possibleIP) {
+		return nil
+	}
+
+	err = netutil.ValidateDomainName(host)
+	if err != nil {
+		return fmt.Errorf("invalid address %s: %w", host, err)
+	}
+
+	return nil
 }
 
 // urlToUpstream converts uu to an Upstream using opts.
@@ -236,26 +281,25 @@ func parseStamp(upsURL *url.URL, opts *Options) (u Upstream, err error) {
 
 	// TODO(e.burkov):  Port?
 	if stamp.ServerAddrStr != "" {
-		host, _, err := netutil.SplitHostPort(stamp.ServerAddrStr)
-		if err != nil {
+		host, _, sErr := netutil.SplitHostPort(stamp.ServerAddrStr)
+		if sErr != nil {
 			host = stamp.ServerAddrStr
 		}
 
-		// Parse and add to options.
-		ip := net.ParseIP(host)
-		if ip == nil {
+		var ip netip.Addr
+		ip, err = netip.ParseAddr(host)
+		if err != nil {
 			return nil, fmt.Errorf("invalid server stamp address %s", stamp.ServerAddrStr)
 		}
 
-		// TODO(e.burkov):  Append?
-		opts.ServerIPAddrs = []net.IP{ip}
+		opts.Bootstrap = StaticResolver{ip}
 	}
 
 	switch stamp.Proto {
 	case dnsstamps.StampProtoTypePlain:
 		return newPlain(&url.URL{Scheme: "udp", Host: stamp.ServerAddrStr}, opts)
 	case dnsstamps.StampProtoTypeDNSCrypt:
-		return newDNSCrypt(upsURL, opts)
+		return newDNSCrypt(upsURL, opts), nil
 	case dnsstamps.StampProtoTypeDoH:
 		return newDoH(&url.URL{Scheme: "https", Host: stamp.ProviderName, Path: stamp.Path}, opts)
 	case dnsstamps.StampProtoTypeDoQ:
@@ -268,7 +312,7 @@ func parseStamp(upsURL *url.URL, opts *Options) (u Upstream, err error) {
 }
 
 // addPort appends port to u if it's absent.
-func addPort(u *url.URL, port int) {
+func addPort(u *url.URL, port uint16) {
 	if u != nil {
 		_, _, err := net.SplitHostPort(u.Host)
 		if err != nil {
@@ -282,98 +326,83 @@ func addPort(u *url.URL, port int) {
 // logBegin logs the start of DNS request resolution.  It should be called right
 // before dialing the connection to the upstream.  n is the [network] that will
 // be used to send the request.
-func logBegin(upstreamAddress string, n network, req *dns.Msg) {
-	qtype := ""
-	target := ""
+func logBegin(l *slog.Logger, addr string, n network, req *dns.Msg) {
+	var qtype dns.Type
+	var qname string
 	if len(req.Question) != 0 {
-		qtype = dns.Type(req.Question[0].Qtype).String()
-		target = req.Question[0].Name
+		qtype = dns.Type(req.Question[0].Qtype)
+		qname = req.Question[0].Name
 	}
-	log.Debug("%s: sending request over %s: %s %s", upstreamAddress, n, qtype, target)
+
+	l.Debug("sending request", "addr", addr, "proto", n, "qtype", qtype, "qname", qname)
 }
 
-// Write to log about the result of DNS request
-func logFinish(upstreamAddress string, n network, err error) {
+// logFinish logs the end of DNS request resolution.  It should be called right
+// after receiving the response from the upstream or the failing action.  n is
+// the [network] that was used to send the request.
+func logFinish(l *slog.Logger, addr string, n network, err error) {
+	lvl := slog.LevelDebug
 	status := "ok"
+
 	if err != nil {
 		status = err.Error()
+		if isTimeout(err) {
+			// Notify user about the timeout.
+			lvl = slog.LevelError
+		}
 	}
-	log.Debug("%s: response received over %s: %s", upstreamAddress, n, status)
+
+	l.Log(context.TODO(), lvl, "response received", "addr", addr, "proto", n, "status", status)
 }
 
-// DialerInitializer returns the handler that it creates.  All the subsequent
-// calls to it, except the first one, will return the same handler so that
-// resolving will be performed only once.
+// isTimeout returns true if err is a timeout error.
+//
+// TODO(e.burkov):  Move to golibs.
+func isTimeout(err error) (ok bool) {
+	var netErr net.Error
+	switch {
+	case
+		errors.Is(err, context.Canceled),
+		errors.Is(err, context.DeadlineExceeded),
+		errors.Is(err, os.ErrDeadlineExceeded):
+		return true
+	case errors.As(err, &netErr):
+		return netErr.Timeout()
+	default:
+		return false
+	}
+}
+
+// DialerInitializer returns the handler that it creates.
 type DialerInitializer func() (handler bootstrap.DialHandler, err error)
 
 // newDialerInitializer creates an initializer of the dialer that will dial the
 // addresses resolved from u using opts.
-func newDialerInitializer(u *url.URL, opts *Options) (di DialerInitializer, err error) {
-	host, port, err := netutil.SplitHostPort(u.Host)
-	if err != nil {
-		return nil, fmt.Errorf("invalid address: %s: %w", u.Host, err)
+func newDialerInitializer(u *url.URL, opts *Options) (di DialerInitializer) {
+	var l *slog.Logger
+	if opts.Logger != nil {
+		l = opts.Logger.With(slogutil.KeyPrefix, "bootstrap")
+	} else {
+		l = slog.Default()
 	}
 
-	if addrsLen := len(opts.ServerIPAddrs); addrsLen > 0 {
-		// Don't resolve the addresses of the server since those from the
-		// options should be used.
-		addrs := make([]string, 0, addrsLen)
-		for _, addr := range opts.ServerIPAddrs {
-			addrs = append(addrs, netutil.JoinHostPort(addr.String(), port))
-		}
-
-		handler := bootstrap.NewDialContext(opts.Timeout, addrs...)
-
-		return func() (bootstrap.DialHandler, error) { return handler, nil }, nil
-	} else if _, err = netip.ParseAddr(host); err == nil {
+	// TODO(e.burkov):  Add netutil.IsValidIPPortString.
+	if _, err := netip.ParseAddrPort(u.Host); err == nil {
 		// Don't resolve the address of the server since it's already an IP.
-		handler := bootstrap.NewDialContext(opts.Timeout, u.Host)
+		handler := bootstrap.NewDialContext(opts.Timeout, l, u.Host)
 
-		return func() (bootstrap.DialHandler, error) { return handler, nil }, nil
+		return func() (h bootstrap.DialHandler, dialerErr error) {
+			return handler, nil
+		}
 	}
 
-	bootstraps := opts.Bootstrap
-	if len(opts.Bootstrap) == 0 {
+	boot := opts.Bootstrap
+	if boot == nil {
 		// Use the default resolver for bootstrapping.
-		bootstraps = []string{""}
+		boot = net.DefaultResolver
 	}
 
-	// Prepare resolvers for bootstrapping.
-	resolvers := make([]Resolver, 0, len(bootstraps))
-	for _, boot := range bootstraps {
-		var r Resolver
-		r, err = NewResolver(boot, opts)
-		if err != nil {
-			// Don't wrap the error since it's informative enough as is.
-			return nil, err
-		}
-
-		resolvers = append(resolvers, r)
+	return func() (h bootstrap.DialHandler, err error) {
+		return bootstrap.ResolveDialContext(u, opts.Timeout, boot, opts.PreferIPv6, l)
 	}
-
-	var dialHandler atomic.Value
-	di = func() (h bootstrap.DialHandler, resErr error) {
-		// Check if the dial handler has already been created.
-		h, ok := dialHandler.Load().(bootstrap.DialHandler)
-		if ok {
-			return h, nil
-		}
-
-		// TODO(e.burkov):  It may appear that several exchanges will try to
-		// resolve the upstream hostname at the same time.  Currently, the last
-		// successful value will be stored in dialHandler, but ideally we should
-		// resolve only once.
-		h, resolveErr := bootstrap.ResolveDialContext(u, opts.Timeout, resolvers, opts.PreferIPv6)
-		if resolveErr != nil {
-			return nil, fmt.Errorf("creating dial handler: %w", resolveErr)
-		}
-
-		if !dialHandler.CompareAndSwap(nil, h) {
-			return dialHandler.Load().(bootstrap.DialHandler), nil
-		}
-
-		return h, nil
-	}
-
-	return di, nil
 }
